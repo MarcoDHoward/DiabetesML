@@ -8,8 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import init_db, get_db, Market, Report, settings
-from scheduler import start_scheduler, run_scan
+from database import init_db, get_db, Market, Report, Wallet, WalletPosition, WalletTrade, settings
+from scheduler import start_scheduler, run_scan, run_whale_scan
 from reports.generator import generate_report
 
 logging.basicConfig(level=logging.INFO)
@@ -156,6 +156,155 @@ async def get_or_create_report(
 
 
 # ─── Admin ─────────────────────────────────────────────────────────────────────
+
+# ─── Whales ────────────────────────────────────────────────────────────────────
+
+def _fmt_wallet(w: Wallet) -> dict:
+    return {
+        "address": w.address,
+        "username": w.username or w.address[:8] + "…",
+        "x_username": w.x_username,
+        "profile_image": w.profile_image,
+        "pnl_month": w.pnl_month,
+        "pnl_all": w.pnl_all,
+        "volume": w.volume,
+        "rank_month": w.rank_month,
+        "last_updated": w.last_updated.isoformat(),
+        "polymarket_url": f"https://polymarket.com/profile/{w.address}",
+    }
+
+
+@app.get("/api/whales")
+async def list_whales(limit: int = 30, db: AsyncSession = Depends(get_db)):
+    """Return top whale wallets sorted by monthly PNL."""
+    from sqlalchemy import asc
+    q = select(Wallet).order_by(asc(Wallet.rank_month)).limit(limit)
+    result = await db.execute(q)
+    wallets = result.scalars().all()
+    return [_fmt_wallet(w) for w in wallets]
+
+
+@app.get("/api/whales/{address}")
+async def get_whale(address: str, db: AsyncSession = Depends(get_db)):
+    """Return a single whale with their open positions and recent trades."""
+    wallet = await db.get(Wallet, address)
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
+    pos_q = (
+        select(WalletPosition)
+        .where(WalletPosition.wallet_address == address)
+        .order_by(desc(WalletPosition.current_value))
+    )
+    trade_q = (
+        select(WalletTrade)
+        .where(WalletTrade.wallet_address == address)
+        .order_by(desc(WalletTrade.timestamp))
+        .limit(10)
+    )
+
+    pos_result = await db.execute(pos_q)
+    trade_result = await db.execute(trade_q)
+    positions = pos_result.scalars().all()
+    trades = trade_result.scalars().all()
+
+    return {
+        **_fmt_wallet(wallet),
+        "positions": [
+            {
+                "condition_id": p.condition_id,
+                "title": p.title,
+                "outcome": p.outcome,
+                "size": p.size,
+                "avg_price": p.avg_price,
+                "cur_price": p.cur_price,
+                "current_value": p.current_value,
+                "cash_pnl": p.cash_pnl,
+                "percent_pnl": p.percent_pnl,
+                "end_date": p.end_date,
+                "url": f"https://polymarket.com/event/{p.slug}" if p.slug else "",
+            }
+            for p in positions
+        ],
+        "recent_trades": [
+            {
+                "title": t.title,
+                "outcome": t.outcome,
+                "side": t.side,
+                "size": t.size,
+                "price": t.price,
+                "usdc_size": t.usdc_size,
+                "timestamp": t.timestamp,
+                "url": f"https://polymarket.com/event/{t.slug}" if t.slug else "",
+            }
+            for t in trades
+        ],
+    }
+
+
+@app.get("/api/whales/overlap/markets")
+async def whale_market_overlap(
+    min_prob: float = 0.85,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Find markets where top whales have open positions AND the market has
+    a high probability — the strongest combined signal.
+    """
+    markets_q = select(Market).where(
+        Market.is_active == True,
+        Market.probability >= min_prob,
+    )
+    markets_result = await db.execute(markets_q)
+    markets = {m.question.lower()[:60]: m for m in markets_result.scalars().all()}
+
+    positions_q = (
+        select(WalletPosition, Wallet)
+        .join(Wallet, WalletPosition.wallet_address == Wallet.address)
+        .order_by(desc(WalletPosition.current_value))
+    )
+    pos_result = await db.execute(positions_q)
+    rows = pos_result.all()
+
+    overlaps = []
+    seen = set()
+    for pos, wallet in rows:
+        pos_key = pos.title.lower()[:60]
+        for mkey, market in markets.items():
+            if pos_key in mkey or mkey in pos_key:
+                overlap_id = f"{market.id}_{wallet.address}"
+                if overlap_id in seen:
+                    continue
+                seen.add(overlap_id)
+                overlaps.append({
+                    "market_id": market.id,
+                    "question": market.question,
+                    "probability": market.probability,
+                    "probability_pct": f"{market.probability * 100:.1f}%",
+                    "source": market.source,
+                    "market_url": market.url,
+                    "whale": {
+                        "address": wallet.address,
+                        "username": wallet.username or wallet.address[:8] + "…",
+                        "rank_month": wallet.rank_month,
+                        "pnl_month": wallet.pnl_month,
+                        "position_outcome": pos.outcome,
+                        "position_size": pos.size,
+                        "position_value": pos.current_value,
+                        "position_pnl_pct": pos.percent_pnl,
+                        "whale_url": f"https://polymarket.com/profile/{wallet.address}",
+                    },
+                })
+
+    overlaps.sort(key=lambda x: x["probability"], reverse=True)
+    return overlaps
+
+
+@app.post("/api/whales/scan")
+async def trigger_whale_scan(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_whale_scan)
+    return {"status": "whale scan triggered"}
+
 
 @app.post("/api/scan")
 async def trigger_scan(background_tasks: BackgroundTasks):

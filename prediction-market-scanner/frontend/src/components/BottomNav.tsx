@@ -6,6 +6,7 @@ const tabs = [
   { href: "/", label: "Markets", icon: "📊" },
   { href: "/whales", label: "Whales", icon: "🐋" },
   { href: "/overlap", label: "Overlap", icon: "🎯" },
+  { href: "/kalshi", label: "Kalshi", icon: "⚡" },
 ];
 
 export default function BottomNav() {

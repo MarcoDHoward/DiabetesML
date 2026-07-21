@@ -8,8 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import init_db, get_db, Market, Report, Wallet, WalletPosition, WalletTrade, settings
-from scheduler import start_scheduler, run_scan, run_whale_scan
+import json as _json
+from database import init_db, get_db, Market, Report, Wallet, WalletPosition, WalletTrade, KalshiSignal, settings
+from scheduler import start_scheduler, run_scan, run_whale_scan, run_kalshi_signal_scan
 from reports.generator import generate_report
 
 logging.basicConfig(level=logging.INFO)
@@ -304,6 +305,53 @@ async def whale_market_overlap(
 async def trigger_whale_scan(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_whale_scan)
     return {"status": "whale scan triggered"}
+
+
+# ─── Kalshi Signals ────────────────────────────────────────────────────────────
+
+SIGNAL_LABELS = {
+    "VOLUME_SPIKE": {"label": "Volume Spike", "color": "amber", "icon": "📈"},
+    "OI_JUMP": {"label": "OI Jump", "color": "purple", "icon": "🔺"},
+    "PRICE_DRIFT_UP": {"label": "Price Drift ↑", "color": "green", "icon": "⬆️"},
+    "PRICE_DRIFT_DOWN": {"label": "Price Drift ↓", "color": "red", "icon": "⬇️"},
+    "BID_PRESSURE": {"label": "Buy Pressure", "color": "green", "icon": "💚"},
+    "ASK_PRESSURE": {"label": "Sell Pressure", "color": "red", "icon": "🔴"},
+}
+
+
+@app.get("/api/kalshi/signals")
+async def list_kalshi_signals(limit: int = 50, db: AsyncSession = Depends(get_db)):
+    """Return current Kalshi smart-money signals, newest first."""
+    q = select(KalshiSignal).order_by(desc(KalshiSignal.detected_at)).limit(limit)
+    result = await db.execute(q)
+    rows = result.scalars().all()
+
+    return [
+        {
+            "ticker": s.ticker,
+            "title": s.title,
+            "signals": _json.loads(s.signals),
+            "signal_meta": [SIGNAL_LABELS.get(sig, {"label": sig, "color": "slate", "icon": "•"})
+                            for sig in _json.loads(s.signals)],
+            "details": _json.loads(s.details),
+            "mid": s.mid,
+            "mid_pct": f"{s.mid * 100:.1f}%",
+            "volume_24h": s.volume_24h,
+            "open_interest": s.open_interest,
+            "close_time": s.close_time,
+            "url": s.url,
+            "detected_at": s.detected_at.isoformat(),
+        }
+        for s in rows
+    ]
+
+
+@app.post("/api/kalshi/scan")
+async def trigger_kalshi_scan(background_tasks: BackgroundTasks):
+    if not settings.kalshi_api_key_id:
+        raise HTTPException(status_code=503, detail="Kalshi API key not configured.")
+    background_tasks.add_task(run_kalshi_signal_scan)
+    return {"status": "Kalshi signal scan triggered"}
 
 
 @app.post("/api/scan")

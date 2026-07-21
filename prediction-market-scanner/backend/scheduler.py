@@ -6,11 +6,13 @@ from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select, delete
 
-from database import SessionLocal, Market, Wallet, WalletPosition, WalletTrade, settings
+import json
+from database import SessionLocal, Market, Wallet, WalletPosition, WalletTrade, KalshiSnapshot, KalshiSignal, settings
 from scanner.polymarket import fetch_high_probability_markets as fetch_poly
 from scanner.kalshi import fetch_high_probability_markets as fetch_kalshi
 from scanner.deduplicator import deduplicate
 from scanner.whale_tracker import fetch_all_whale_data
+from scanner.kalshi_signals import fetch_market_snapshots, compute_signals
 
 log = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
@@ -164,6 +166,77 @@ async def run_whale_scan():
     log.info("Whale scan complete — %d whales updated", len(whales))
 
 
+async def run_kalshi_signal_scan():
+    """Snapshot Kalshi markets, diff vs previous snapshot, store signals."""
+    if not settings.kalshi_api_key_id:
+        log.debug("Kalshi not configured — skipping signal scan")
+        return
+
+    log.info("Starting Kalshi signal scan")
+    try:
+        current = await fetch_market_snapshots(
+            settings.kalshi_api_key_id,
+            settings.kalshi_private_key_path,
+        )
+    except Exception as e:
+        log.error("Kalshi snapshot fetch failed: %s", e)
+        return
+
+    async with SessionLocal() as session:
+        # Load previous snapshots (most recent per ticker)
+        from sqlalchemy import text
+        prev_rows = await session.execute(
+            text("""
+                SELECT ticker, title, yes_bid, yes_ask, mid, volume_24h,
+                       open_interest, close_time, url, ts
+                FROM kalshi_snapshots s1
+                WHERE ts = (SELECT MAX(ts) FROM kalshi_snapshots s2 WHERE s2.ticker = s1.ticker)
+            """)
+        )
+        previous = [dict(r._mapping) for r in prev_rows]
+
+        # Compute signals
+        signals = compute_signals(current, previous)
+
+        # Store new snapshots
+        for snap in current:
+            session.add(KalshiSnapshot(**snap))
+
+        # Replace current signals
+        await session.execute(KalshiSignal.__table__.delete())
+        for sig in signals:
+            session.add(KalshiSignal(
+                ticker=sig["ticker"],
+                title=sig["title"],
+                signals=json.dumps(sig["signals"]),
+                details=json.dumps(sig["details"]),
+                mid=sig["mid"],
+                volume_24h=sig["volume_24h"],
+                open_interest=sig["open_interest"],
+                close_time=sig["close_time"],
+                url=sig["url"],
+            ))
+
+        # Prune old snapshots (keep last 4 per ticker = ~1 hour at 15m intervals)
+        await session.execute(
+            text("""
+                DELETE FROM kalshi_snapshots
+                WHERE id NOT IN (
+                    SELECT id FROM kalshi_snapshots s1
+                    WHERE id IN (
+                        SELECT id FROM kalshi_snapshots s2
+                        WHERE s2.ticker = s1.ticker
+                        ORDER BY ts DESC LIMIT 4
+                    )
+                )
+            """)
+        )
+
+        await session.commit()
+
+    log.info("Kalshi signal scan complete — %d signals detected", len(signals))
+
+
 def start_scheduler():
     scheduler.add_job(
         run_scan,
@@ -176,10 +249,18 @@ def start_scheduler():
     scheduler.add_job(
         run_whale_scan,
         trigger="interval",
-        minutes=30,  # Whales change slower than prices
+        minutes=30,
         id="whale_scan",
         replace_existing=True,
         next_run_time=datetime.utcnow(),
     )
+    scheduler.add_job(
+        run_kalshi_signal_scan,
+        trigger="interval",
+        minutes=settings.scan_interval_minutes,
+        id="kalshi_signals",
+        replace_existing=True,
+        next_run_time=datetime.utcnow(),
+    )
     scheduler.start()
-    log.info("Scheduler started (market=%dm, whale=30m)", settings.scan_interval_minutes)
+    log.info("Scheduler started (market=%dm, whale=30m, kalshi=%dm)", settings.scan_interval_minutes, settings.scan_interval_minutes)

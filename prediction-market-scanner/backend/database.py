@@ -102,6 +102,40 @@ class WalletTrade(Base):
     slug: Mapped[str] = mapped_column(String, default="")
 
 
+class KalshiSnapshot(Base):
+    """Raw market snapshot stored each scan cycle for delta computation."""
+    __tablename__ = "kalshi_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String, index=True)
+    title: Mapped[str] = mapped_column(Text)
+    yes_bid: Mapped[float] = mapped_column(Float)
+    yes_ask: Mapped[float] = mapped_column(Float)
+    mid: Mapped[float] = mapped_column(Float)
+    volume_24h: Mapped[float] = mapped_column(Float)
+    open_interest: Mapped[float] = mapped_column(Float)
+    close_time: Mapped[str] = mapped_column(String, default="")
+    url: Mapped[str] = mapped_column(String, default="")
+    ts: Mapped[int] = mapped_column(default=0)
+
+
+class KalshiSignal(Base):
+    """Detected smart-money signals on Kalshi markets."""
+    __tablename__ = "kalshi_signals"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String, index=True)
+    title: Mapped[str] = mapped_column(Text)
+    signals: Mapped[str] = mapped_column(Text)   # JSON list of signal names
+    details: Mapped[str] = mapped_column(Text)   # JSON details dict
+    mid: Mapped[float] = mapped_column(Float)
+    volume_24h: Mapped[float] = mapped_column(Float)
+    open_interest: Mapped[float] = mapped_column(Float)
+    close_time: Mapped[str] = mapped_column(String, default="")
+    url: Mapped[str] = mapped_column(String, default="")
+    detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
